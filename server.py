@@ -19,6 +19,12 @@ log = logging.getLogger(__name__)
 
 RELAY_URL = os.environ["RELAY_URL"]
 HERE_API_KEY = os.environ["HERE_API_KEY"]
+SPOTIFY_CLIENT_ID     = os.environ.get("SPOTIFY_CLIENT_ID", "")
+SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
+SPOTIFY_REFRESH_TOKEN = os.environ.get("SPOTIFY_REFRESH_TOKEN", "")
+
+_spotify_access_token = None
+_spotify_token_expires = 0.0
 
 # ── Ticker aliases (tên công ty → mã cổ phiếu) ───────────────────────────────
 TICKER_ALIASES = {
@@ -150,6 +156,34 @@ TOOLS = [
                 }
             },
             "required": [],
+        },
+    },
+    {
+        "name": "spotify_control",
+        "description": (
+            "Điều khiển Spotify: xem bài đang phát, phát nhạc, dừng, chuyển bài, "
+            "tìm và phát bài hát theo tên hoặc nghệ sĩ, chỉnh âm lượng. "
+            "Gọi khi người dùng muốn nghe nhạc, hỏi bài gì đang phát, "
+            "bảo next/skip/dừng nhạc, hoặc yêu cầu phát bài cụ thể."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["current", "play", "pause", "next", "previous", "search", "volume"],
+                    "description": "Hành động: current=đang phát gì, play=phát, pause=dừng, next=bài tiếp, previous=bài trước, search=tìm và phát, volume=âm lượng.",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Tên bài hát hoặc nghệ sĩ (dùng khi action=search). Ví dụ: 'Nơi này có anh Sơn Tùng', 'Mỹ Tâm', 'Bích Phương'.",
+                },
+                "volume": {
+                    "type": "integer",
+                    "description": "Mức âm lượng 0-100 (dùng khi action=volume).",
+                },
+            },
+            "required": ["action"],
         },
     },
     {
@@ -464,6 +498,160 @@ async def tool_get_traffic(args: dict) -> str:
         return f"Không lấy được thông tin giao thông cho {location}."
 
 
+async def spotify_get_token() -> str:
+    import time, base64
+    global _spotify_access_token, _spotify_token_expires
+    if _spotify_access_token and time.time() < _spotify_token_expires - 60:
+        return _spotify_access_token
+    creds = base64.b64encode(f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode()).decode()
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(
+            "https://accounts.spotify.com/api/token",
+            headers={"Authorization": f"Basic {creds}"},
+            data={"grant_type": "refresh_token", "refresh_token": SPOTIFY_REFRESH_TOKEN},
+        )
+        data = r.json()
+    _spotify_access_token = data["access_token"]
+    _spotify_token_expires = time.time() + data.get("expires_in", 3600)
+    return _spotify_access_token
+
+
+async def spotify_get_device_id(client, headers: dict) -> str | None:
+    """Return the active device_id, or the first available one if none is active."""
+    r = await client.get("https://api.spotify.com/v1/me/player/devices", headers=headers)
+    if r.status_code != 200:
+        return None
+    devices = r.json().get("devices", [])
+    if not devices:
+        return None
+    active = next((d for d in devices if d.get("is_active")), None)
+    return (active or devices[0])["id"]
+
+
+async def tool_spotify(args: dict) -> str:
+    action = args.get("action", "current").lower().strip()
+    query  = args.get("query", "").strip()
+    volume = args.get("volume", -1)
+
+    try:
+        token = await spotify_get_token()
+        headers = {"Authorization": f"Bearer {token}"}
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            if action == "current":
+                r = await client.get(
+                    "https://api.spotify.com/v1/me/player/currently-playing", headers=headers)
+                if r.status_code == 204:
+                    return "Spotify hiện không phát nhạc."
+                data = r.json()
+                item = data.get("item") or {}
+                name    = item.get("name", "Unknown")
+                artists = ", ".join(a["name"] for a in item.get("artists", []))
+                status  = "đang phát" if data.get("is_playing") else "đã dừng"
+                prog_s  = (data.get("progress_ms") or 0) // 1000
+                dur_s   = (item.get("duration_ms") or 0) // 1000
+                return (f"Spotify {status}: {name} - {artists} "
+                        f"({prog_s//60}:{prog_s%60:02d} / {dur_s//60}:{dur_s%60:02d})")
+
+            elif action == "play":
+                r = await client.put(
+                    "https://api.spotify.com/v1/me/player/play", headers=headers)
+                if r.status_code in (200, 204):
+                    return "Đã phát nhạc."
+                if r.status_code == 404:
+                    device_id = await spotify_get_device_id(client, headers)
+                    if not device_id:
+                        return "Không tìm thấy thiết bị Spotify nào. Hãy mở app Spotify trên điện thoại hoặc máy tính."
+                    r2 = await client.put(
+                        "https://api.spotify.com/v1/me/player/play",
+                        headers=headers,
+                        params={"device_id": device_id},
+                    )
+                    return "Đã phát nhạc." if r2.status_code in (200, 204) else f"Không thể phát nhạc (lỗi {r2.status_code})."
+                return f"Không thể phát nhạc (lỗi {r.status_code})."
+
+            elif action == "pause":
+                r = await client.put(
+                    "https://api.spotify.com/v1/me/player/pause", headers=headers)
+                if r.status_code in (200, 204):
+                    return "Đã dừng nhạc."
+                if r.status_code == 404:
+                    return "Spotify không có thiết bị nào đang phát."
+                return f"Không thể dừng nhạc (lỗi {r.status_code})."
+
+            elif action == "next":
+                r = await client.post(
+                    "https://api.spotify.com/v1/me/player/next", headers=headers)
+                if r.status_code in (200, 204):
+                    return "Đã chuyển bài tiếp theo."
+                if r.status_code == 404:
+                    return "Spotify không có thiết bị nào đang active."
+                return f"Không thể chuyển bài (lỗi {r.status_code})."
+
+            elif action == "previous":
+                r = await client.post(
+                    "https://api.spotify.com/v1/me/player/previous", headers=headers)
+                if r.status_code in (200, 204):
+                    return "Đã quay lại bài trước."
+                if r.status_code == 404:
+                    return "Spotify không có thiết bị nào đang active."
+                return f"Không thể quay lại bài trước (lỗi {r.status_code})."
+
+            elif action == "search":
+                if not query:
+                    return "Cần nhập tên bài hát hoặc nghệ sĩ để tìm kiếm."
+                r = await client.get(
+                    "https://api.spotify.com/v1/search",
+                    headers=headers,
+                    params={"q": query, "type": "track", "limit": 1, "market": "VN"},
+                )
+                tracks = r.json().get("tracks", {}).get("items", [])
+                if not tracks:
+                    return f"Không tìm thấy bài hát '{query}'."
+                track   = tracks[0]
+                name    = track["name"]
+                artists = ", ".join(a["name"] for a in track.get("artists", []))
+                r2 = await client.put(
+                    "https://api.spotify.com/v1/me/player/play",
+                    headers=headers,
+                    json={"uris": [track["uri"]]},
+                )
+                if r2.status_code in (200, 204):
+                    return f"Đang phát: {name} - {artists}"
+                if r2.status_code == 404:
+                    device_id = await spotify_get_device_id(client, headers)
+                    if not device_id:
+                        return f"Tìm thấy '{name} - {artists}' nhưng không tìm thấy thiết bị Spotify nào. Hãy mở app Spotify rồi thử lại."
+                    r3 = await client.put(
+                        "https://api.spotify.com/v1/me/player/play",
+                        headers=headers,
+                        params={"device_id": device_id},
+                        json={"uris": [track["uri"]]},
+                    )
+                    return f"Đang phát: {name} - {artists}" if r3.status_code in (200, 204) else f"Không thể phát '{name}' (lỗi {r3.status_code})."
+                return f"Tìm thấy '{name} - {artists}' nhưng không thể phát (lỗi {r2.status_code})."
+
+            elif action == "volume":
+                vol = max(0, min(100, int(volume))) if volume >= 0 else 50
+                r = await client.put(
+                    "https://api.spotify.com/v1/me/player/volume",
+                    headers=headers,
+                    params={"volume_percent": vol},
+                )
+                if r.status_code in (200, 204):
+                    return f"Đã chỉnh âm lượng về {vol}%."
+                if r.status_code == 403:
+                    return "Không thể chỉnh âm lượng qua API với thiết bị này (thường gặp trên điện thoại). Hãy chỉnh trực tiếp trên app."
+                return f"Không thể chỉnh âm lượng (lỗi {r.status_code})."
+
+            else:
+                return "Action không hợp lệ. Dùng: current, play, pause, next, previous, search, volume."
+
+    except Exception as e:
+        log.error(f"Spotify error: {e}")
+        return f"Lỗi Spotify: {e}"
+
+
 async def tool_get_trending(args: dict) -> str:
     # Google News RSS Vietnam top stories
     try:
@@ -506,6 +694,7 @@ TOOL_HANDLERS = {
     "get_gold_price":      tool_get_gold,
     "get_crypto_price":    tool_get_crypto,
     "get_traffic_vietnam": tool_get_traffic,
+    "spotify_control":     tool_spotify,
     "get_trending_topics": tool_get_trending,
 }
 
@@ -595,7 +784,7 @@ async def run():
         try:
             log.info(f"Connecting to relay...")
             async with websockets.connect(RELAY_URL, ping_interval=30, ping_timeout=10) as ws:
-                log.info("Connected — 7 tools ready: news, weather, stock, gold, crypto, traffic, trending")
+                log.info("Connected — 8 tools ready: news, weather, stock, gold, crypto, traffic, spotify, trending")
                 backoff = 3
                 async for raw in ws:
                     await handle_message(ws, raw)
